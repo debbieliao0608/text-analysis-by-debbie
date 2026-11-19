@@ -7,6 +7,7 @@
 
 import io
 import math
+import os
 import re
 import html as html_module
 from collections import Counter, defaultdict
@@ -91,6 +92,102 @@ def read_text(raw_bytes: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return raw_bytes.decode("utf-8", errors="replace")   # 兜底：不认识的字节替换掉
+
+
+# ---------------------------------------------------------------- 历史记录（Supabase）
+def get_secret(name: str) -> str:
+    """先从 Streamlit Secrets 读，读不到再读环境变量"""
+    try:
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.environ.get(name, "")
+
+
+SUPABASE_URL = get_secret("SUPABASE_URL").rstrip("/")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
+HISTORY_ON = bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def save_history(filename: str, text: str, word_count: int, vocab: int, top_words: str) -> bool:
+    """把一次分析写进数据库"""
+    import requests
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    payload = {
+        "filename": filename,
+        "word_count": word_count,
+        "vocab": vocab,
+        "top_words": top_words,
+        "content": text,
+    }
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/history", json=payload, headers=headers, timeout=15)
+    return r.status_code in (200, 201, 204)
+
+
+def load_history(limit: int = 100):
+    """读出最近的记录，失败返回 None"""
+    import requests
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    params = {"select": "*", "order": "created_at.desc", "limit": str(limit)}
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/history", headers=headers, params=params, timeout=15)
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+
+def render_history():
+    """历史记录页面：凭密码查看所有保存过的文本"""
+    st.title("历史记录")
+    st.caption("所有使用者保存过的文本与分析摘要")
+
+    if not HISTORY_ON:
+        st.info("尚未配置云端数据库。请在 Streamlit Cloud 的 Secrets 中填入 SUPABASE_URL 与 SUPABASE_KEY。")
+        return
+
+    pwd = get_secret("ADMIN_PASSWORD")
+    if pwd:
+        entered = st.text_input("查看密码", type="password",
+                                help="由管理员在 Secrets 中设置，只有知道密码的人能查看记录")
+        if entered != pwd:
+            st.stop()
+
+    rows = load_history()
+    if rows is None:
+        st.error("读取数据库失败，请检查 SUPABASE_URL / SUPABASE_KEY 是否正确。")
+        return
+    if not rows:
+        st.info("还没有记录。在任一模块里点「保存本次文本到历史记录」即可。")
+        return
+
+    df = pd.DataFrame([{
+        "时间": (r.get("created_at") or "")[:19].replace("T", " "),
+        "文件名": r.get("filename", ""),
+        "词数": r.get("word_count", 0),
+        "词型数": r.get("vocab", 0),
+        "Top 词": r.get("top_words", ""),
+    } for r in rows])
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("查看某条记录的原文")
+    idx = st.selectbox(
+        "选择记录",
+        list(range(len(rows))),
+        format_func=lambda i: f"{rows[i].get('filename', '')}｜{(rows[i].get('created_at') or '')[:19].replace('T', ' ')}",
+    )
+    st.text_area("原文", rows[idx].get("content", "") or "", height=400)
+    st.download_button(
+        "下载这条原文",
+        (rows[idx].get("content", "") or "").encode("utf-8"),
+        file_name=rows[idx].get("filename", "text.txt"),
+    )
 
 
 @st.cache_data(show_spinner="正在分词、标注词性…")
@@ -236,7 +333,7 @@ def keyword_table(data, method: str) -> pd.DataFrame:
 # ---------------------------------------------------------------- 侧边栏
 with st.sidebar:
     st.markdown("### 功能模块")
-    module = st.selectbox("选择模块", ["词频分析", "提取关键词", "情感分析"], label_visibility="collapsed")
+    module = st.selectbox("选择模块", ["词频分析", "提取关键词", "情感分析", "历史记录"], label_visibility="collapsed")
 
     st.divider()
     st.markdown("### 语料")
@@ -282,6 +379,11 @@ else:
     text = read_text(DEFAULT_FILE.read_bytes())
     source_name = DEFAULT_FILE.name
 
+# 历史记录模块不需要跑分析，直接渲染后结束
+if module == "历史记录":
+    render_history()
+    st.stop()
+
 data = analyze(text, custom_stop, use_nltk_stop, tuple(pos_choice), use_lemma)
 tokens = data["tokens"]
 kept = data["kept"]
@@ -292,6 +394,20 @@ vocab = len(counter)
 # ---------------------------------------------------------------- 标题区
 st.title("英文综合文本分析与展示系统")
 st.caption(f"当前模块：**{module}**　|　语料：**{source_name}**　|　基于 NLTK")
+
+# ---------------- 保存到历史记录 ----------------
+if HISTORY_ON:
+    with st.expander("💾 保存本次文本到历史记录", expanded=False):
+        st.caption("保存后，在「历史记录」模块里可以随时查看这篇文本和它的统计摘要。")
+        if st.button("保存这篇文本"):
+            ok = save_history(
+                source_name, text, total_words, vocab,
+                ", ".join(w for w, _ in counter.most_common(10)),
+            )
+            if ok:
+                st.success("已保存，去左侧「历史记录」模块查看。")
+            else:
+                st.error("保存失败，请稍后重试（或检查数据库配置）。")
 
 # ================================================================ 模块一：词频分析
 if module == "词频分析":
